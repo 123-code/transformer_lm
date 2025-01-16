@@ -5,6 +5,34 @@ import torch.nn.functional as F
 import tiktoken
 from dataclasses import dataclass
 
+
+#cargamos los datos
+class DataLoader:
+    def __init__(self,B,T):
+        self.B = B
+        self.T = T
+
+        with open('input.txt','r') as f:
+            text = f.read()
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        self.current_position = 0
+
+    def next_batch(self):
+        B,T = self.B,self.T
+        buf = self.tokens[self.current_position: self.current_position+ B*T+1]
+        x = (buf[:-1]).view(B,T)
+        y = (buf[1:]).view(B,T)
+
+        self.current_position += B*T
+
+        if self.current_position + (B*T + 1) >len(self.tokens):
+            self.current_position = 0
+        return x,y
+
+
+
 #clase de configuracion
 @dataclass
 class Config:
@@ -22,13 +50,28 @@ class GPT(nn.Module):
         self.config = Config
 
         self.wte = nn.Embedding(Config.vocab_size,Config.embedding_dim)
+   
+   
         self.wpe = nn.Embedding(Config.block_size,Config.embedding_dim)
 
         self.blocks = nn.ModuleList([TransformerBlock(Config) for _ in range(Config.n_layer)])
 
         self.ln_f = nn.LayerNorm(Config.embedding_dim)
         self.lm_head = nn.Linear(Config.embedding_dim,Config.vocab_size,bias=False)
+        self.apply(self.init_weights)
 
+
+    def init_weights(self,module):
+        if isinstance(module,nn.Linear):
+            std = 0.02
+            if hasattr(module,'NANOGPT_SCALE_INIT'):
+                std *= (2*self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight,mean=0.0,std = std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module,nn.Embedding):
+            torch.nn.init.normal_(module.weight,mean=0.0,std=0.02)
+    
     def forward(self,idx):
         B,T = idx.size()
         assert T <= self.config.block_size
@@ -54,6 +97,7 @@ class MultiheadAttention(nn.Module):
         self.n_head = Config.n_head
     
         self.attn = nn.Linear(Config.embedding_dim,3*Config.embedding_dim)
+   
         self.c_proj = nn.Linear(Config.embedding_dim,Config.embedding_dim)
         self.register_buffer("bias",torch.tril(torch.ones(Config.block_size,Config.block_size)).
                              view(1,1,Config.block_size,Config.block_size))
@@ -64,7 +108,11 @@ class MultiheadAttention(nn.Module):
 
 
         B,T,C = x.size()
+    
+
         qkv = self.attn(x)
+       # print(qkv)
+
         #dividimos al tensor en los tres vectores q,k,v de size embedding_dim
         # el .transpose se usa para poder 
         q,k,v = qkv.split(Config.embedding_dim,dim=2)
@@ -76,8 +124,9 @@ class MultiheadAttention(nn.Module):
 
         attn = (q@k.transpose(2,-1)) * (1.0/math.sqrt(k.size(-1)))
         #aplicar una mascara para evitar que el modelo "mire hacia adelante"
-        attn = attn.masked_fill(self.bias[:,:,:T,T]==0,float('-inf'))
+        attn = attn.masked_fill(self.bias[:,:,:T,:T]==0,float('-inf'))
         attn = F.softmax(attn,dim=-1)
+     
         y = attn @ v
         # despues de calcular la atencion multicabeza, debemos reorganizar las llos resultados en una sola operacion
         #luego con .view(B,T,C) fusionamos las cabezas de atencion en un solo embedding. combinandolas en una sola dimension C
@@ -114,9 +163,6 @@ class TransformerBlock(nn.Module):
         return x
 
 
-
-
-
 encoding = tiktoken.get_encoding("cl100k_base")
 tokens = encoding.encode(sample_text)
 tokens = torch.tensor(tokens,dtype=torch.long)
@@ -124,13 +170,8 @@ tokens = torch.tensor(tokens,dtype=torch.long)
 block_size = 8
 batch_size = 4
 
-def get_batch(tokens, block_size, batch_size):
-    # Seleccionar índices aleatorios para los lotes
-    ix = torch.randint(len(tokens) - block_size, (batch_size,))
-    x = torch.stack([tokens[i:i+block_size] for i in ix])
-    y = torch.stack([tokens[i+1:i+block_size+1] for i in ix])
-    return x, y
 
+train_loader = DataLoader(B=4,T=32)
 model = GPT(Config)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
@@ -140,17 +181,19 @@ optimizer = torch.optim.Adam(model.parameters(),lr=3e-4)
 num_epochs = 1000
 
 for epoch in range(num_epochs):
-    x,y = get_batch(tokens,block_size,batch_size)
+    x,y = train_loader.next_batch()
     x,y = x.to(device),y.to(device)
+    optimizer.zero_grad()
 
     logits = model(x)
-    print(logits)
+
 
     loss = criterion(logits.view(-1,Config.vocab_size),y.view(-1))
-    optimizer.zero_grad()
+   
     loss.backward()
     optimizer.step()
 
     if epoch % 10 == 0:
         print(f"Epoch {epoch}, Loss: {loss.item()}")
+        
         
