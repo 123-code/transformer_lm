@@ -43,7 +43,6 @@ class Config:
     n_layer = 12
 
 
-sample_text = "This is an example sentence. This sentence is used to train the GPT model"
 class GPT(nn.Module):
     def __init__(self,Config):
         super().__init__()
@@ -86,6 +85,7 @@ class GPT(nn.Module):
         x = self.ln_f(x)
 
         logits = self.lm_head(x)
+        #print(logits)
 
         return logits 
     
@@ -163,22 +163,24 @@ class TransformerBlock(nn.Module):
         return x
 
 
-encoding = tiktoken.get_encoding("cl100k_base")
-tokens = encoding.encode(sample_text)
-tokens = torch.tensor(tokens,dtype=torch.long)
+
 
 block_size = 8
 batch_size = 4
-
 
 train_loader = DataLoader(B=4,T=32)
 model = GPT(Config)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
+model = torch.compile(model)
+
+
+
+
 
 criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.Adam(model.parameters(),lr=3e-4)
-num_epochs = 1000
+num_epochs = 100
 
 for epoch in range(num_epochs):
     x,y = train_loader.next_batch()
@@ -196,4 +198,35 @@ for epoch in range(num_epochs):
     if epoch % 10 == 0:
         print(f"Epoch {epoch}, Loss: {loss.item()}")
         
-        
+model_path = "nano_gpt.pth"
+torch.save(model.state_dict(),model_path)
+
+
+def generate(model,idx,max_new_tokens,temperature=1.0,top_k=None):
+    for x in range(max_new_tokens):
+
+        idx_cond = idx[:,-model.config.block_size:]
+        logits = model(idx_cond)
+
+        logits = logits[:,-1,:]/temperature
+
+        if top_k is not None:
+            v,_ = torch.topk(logits,top_k)
+            logits[logits<v[:,[-1]]] = -float('Inf')
+
+        probs = F.softmax(logits,dim=-1)
+        idx_next = torch.multinomial(probs,num_samples=1)
+        idx = torch.cat((idx,idx_next),dim=1)
+    return idx
+model.load_state_dict(torch.load('nano_gpt.pth'))
+model.eval()
+encoding = tiktoken.get_encoding('gpt2')
+initial_tokens = encoding.encode("This is a test sentence.")
+initial_tokens = torch.tensor([initial_tokens],dtype=torch.long).to(device)
+generated = generate(model,initial_tokens,100)
+print(generated)
+decoded_text = encoding.decode(generated[0].tolist())
+print(decoded_text)
+
+print(sum(x.numel() for x in model.parameters() if x.requires_grad))
+#generated_text = encoding.decode(generated[0].tolist())
